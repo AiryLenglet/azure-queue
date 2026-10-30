@@ -1,0 +1,20 @@
+# Terraform: never commit state, plans or tfvars. DO commit .terraform.lock.hcl (and backend.hcl, it holds no secret)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+tfplan
+*.tfplan
+crash.log
+# Override files, e.g. the temporary backend_override.tf of bootstrap's first apply (README, step 1)
+override.tf
+*_override.tf
+
+# Maven
+target/
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
