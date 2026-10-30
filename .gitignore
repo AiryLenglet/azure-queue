@@ -10,8 +10,9 @@ crash.log
 override.tf
 *_override.tf
 
-# Maven
+# Maven, Azure Functions (local.settings.json holds secrets when you run the function locally)
 target/
+local.settings.json
 
 # IDE / OS
 .idea/

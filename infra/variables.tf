@@ -10,8 +10,8 @@ variable "name" {
   default     = "queuepoc"
 
   validation {
-    condition     = can(regex("^[a-z0-9]{1,16}$", var.name))
-    error_message = "Lowercase letters and digits only, 16 characters max (storage account naming rules)."
+    condition     = can(regex("^[a-z0-9]{1,14}$", var.name))
+    error_message = "Lowercase letters and digits only, 14 characters max (storage account names: st + name + fn + 6-character suffix, 24 max)."
   }
 }
 
