@@ -159,9 +159,117 @@ resource "azurerm_function_app_flex_consumption" "this" {
     ServiceBus__credential              = "managedidentity"
     ServiceBus__clientId                = azurerm_user_assigned_identity.consumer.client_id
     QUEUE_NAME                          = azurerm_servicebus_queue.orders.name
+
+    # Java: the Application Insights Java agent sends the runs, their logs and their exceptions. Without it, an instance
+    # started from a pre-warmed one (every scale-out) sends none of them, only CPU and memory counters.
+    APPLICATIONINSIGHTS_ENABLE_AGENT = "true"
   }
 
   site_config {
     application_insights_connection_string = azurerm_application_insights.this.connection_string
+  }
+}
+
+# --- Alerts: an email when messages are dead-lettered, pile up or keep failing --------------------------
+# Metric alerts, evaluated by Azure Monitor. Stateful: one email when an alert fires, one when it resolves, none in
+# between. Severity 1 = error (orders aren't processed), 2 = warning (someone must look). See README, "Monitoring".
+
+resource "azurerm_monitor_action_group" "this" {
+  name                = "ag-${var.name}"
+  resource_group_name = azurerm_resource_group.this.name
+  short_name          = substr(var.name, 0, 12) # shown in notifications, 12 characters max
+  tags                = local.tags
+
+  email_receiver {
+    name                    = "operators"
+    email_address           = var.alert_email
+    use_common_alert_schema = true # the same email layout for every alert type
+  }
+}
+
+# The dead-letter queue should stay empty: a message there is an order that failed 5 times, and needs a person
+resource "azurerm_monitor_metric_alert" "dead_letters" {
+  name                = "${var.name}-dead-letters"
+  resource_group_name = azurerm_resource_group.this.name
+  scopes              = [azurerm_servicebus_namespace.this.id]
+  description         = "Messages in ${azurerm_servicebus_queue.orders.name}/$deadletterqueue: triage them, then empty it (README, Monitoring)."
+  severity            = 2
+  frequency           = "PT1M" # checked every minute...
+  window_size         = "PT5M" # ...over the last 5 minutes
+  tags                = local.tags
+
+  criteria {
+    metric_namespace = "Microsoft.ServiceBus/namespaces"
+    metric_name      = "DeadletteredMessages" # messages in the dead-letter queue
+    aggregation      = "Maximum"
+    operator         = "GreaterThan"
+    threshold        = 0
+
+    dimension {
+      name     = "EntityName" # the metric is per queue: this one
+      operator = "Include"
+      values   = [azurerm_servicebus_queue.orders.name]
+    }
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.this.id
+  }
+}
+
+# Falling behind: more than backlog_alert_threshold messages for 15 minutes straight. Messages being processed stay in
+# the queue until completed and count too, so a busy queue is never empty: that's why the threshold isn't 0, and why it
+# must stay above what the app processes at once at full scale (50 instances x 16 concurrent calls = 800).
+resource "azurerm_monitor_metric_alert" "backlog" {
+  name                = "${var.name}-backlog"
+  resource_group_name = azurerm_resource_group.this.name
+  scopes              = [azurerm_servicebus_namespace.this.id]
+  description         = "${azurerm_servicebus_queue.orders.name} has held more than ${var.backlog_alert_threshold} messages for 15 minutes: the function is falling behind or stopped (README, Monitoring)."
+  severity            = 1
+  frequency           = "PT5M"
+  window_size         = "PT15M"
+  tags                = local.tags
+
+  criteria {
+    metric_namespace = "Microsoft.ServiceBus/namespaces"
+    metric_name      = "ActiveMessages" # messages waiting or being processed
+    aggregation      = "Minimum"        # lowest count over the 15 minutes: a burst drained in time doesn't fire it
+    operator         = "GreaterThan"
+    threshold        = var.backlog_alert_threshold
+
+    dimension {
+      name     = "EntityName"
+      operator = "Include"
+      values   = [azurerm_servicebus_queue.orders.name]
+    }
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.this.id
+  }
+}
+
+# Failed runs are retried at once: many of them mean a dependency is down or a bad deployment, often before messages
+# reach the dead-letter queue. Every attempt counts, so one message failing its 5 attempts alone doesn't fire it.
+resource "azurerm_monitor_metric_alert" "failures" {
+  name                = "${var.name}-failures"
+  resource_group_name = azurerm_resource_group.this.name
+  scopes              = [azurerm_application_insights.this.id]
+  description         = "More than 5 function runs failed within 15 minutes: the exceptions table of Application Insights says why (README, Finding the logs)."
+  severity            = 2
+  frequency           = "PT5M"
+  window_size         = "PT15M"
+  tags                = local.tags
+
+  criteria {
+    metric_namespace = "microsoft.insights/components"
+    metric_name      = "requests/failed" # Application Insights records each function run as a request
+    aggregation      = "Count"
+    operator         = "GreaterThan"
+    threshold        = 5
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.this.id
   }
 }

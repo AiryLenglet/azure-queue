@@ -1,10 +1,10 @@
 # Service Bus consumer – Azure Functions PoC
 
-A Service Bus-triggered Azure Function in Java 21, on the Flex Consumption plan (scales to zero, billed per execution), with production patterns: retries, dead-letter queue, duplicate detection, at-least-once handling, Entra ID only for messaging (no Service Bus keys). All infrastructure is Terraform.
+A Service Bus-triggered Azure Function in Java 21, on the Flex Consumption plan (scales to zero, billed per execution), with production patterns: retries, dead-letter queue, alerts, duplicate detection, at-least-once handling, Entra ID only for messaging (no Service Bus keys). All infrastructure is Terraform.
 
 ```
 bootstrap/                Terraform, run once: storage for the Terraform states, its own included (see "Terraform" below)
-infra/                    Terraform: the PoC (Service Bus queue, Function App, its identity and roles, Application Insights)
+infra/                    Terraform: the PoC (Service Bus queue, Function App, its identity and roles, Application Insights, alerts)
 app/                      Maven: the function, packaged by azure-functions-maven-plugin. One dependency, plus JUnit for the tests.
   OrderFunction.java      Service Bus trigger: complete or retry, one log line per outcome      <- start here
   OrderHandler.java       business logic stub with simulated failures
@@ -48,6 +48,7 @@ rm -f terraform.tfstate terraform.tfstate.backup                        # no lon
 # 2. The PoC infrastructure (its state goes to the same storage)
 cd ../infra
 cp ../bootstrap/backend.hcl .
+echo 'alert_email = "you@example.com"' > terraform.tfvars   # your address, for the alerts (git-ignored; plan and destroy read it)
 terraform init -reconfigure -backend-config=backend.hcl
 terraform plan -out=tfplan                      # review what will change...
 terraform apply tfplan                          # ...and apply exactly that
@@ -72,13 +73,14 @@ az monitor app-insights query -g "$RESOURCE_GROUP" --app "$APP_INSIGHTS" --query
   --analytics-query "traces | where timestamp > ago(30m) and tostring(customDimensions.Category) == 'Function.ProcessOrder.User' | order by timestamp asc | project timestamp, message"
 az servicebus queue show -g "$RESOURCE_GROUP" --namespace-name "$SERVICEBUS_NAMESPACE" -n "$QUEUE_NAME" \
   --query "countDetails.{active: activeMessageCount, deadLettered: deadLetterMessageCount}" -o table
+# Within about 10 minutes: alert emails for the dead-letter queue and for the failed runs (see "Monitoring")
 
 # Clean up: infra first, then the state storage (protected from `terraform destroy`: see "Terraform" below)
 cd ../infra && terraform destroy
 az group delete --name rg-tfstate --yes
 ```
 
-- To read the dead-lettered messages and why they were dead-lettered: in the Azure portal, open the Service Bus namespace, then **Queues**, `orders`, **Service Bus Explorer**, **Dead-letter**, **Peek from start**. Each message shows its `DeadLetterReason`. You can also re-send them to the queue from there once the cause is fixed.
+- To read the dead-lettered messages, find why they failed, then re-send or remove them: see "Monitoring".
 - Right after an `apply`, RBAC changes take a few minutes to propagate: a `401`/`403` from curl, authorization errors in the function's logs, or a `403` from `terraform init` (step 1's state migration, step 2's first init). Wait and retry.
 - After the first `terraform init` of each stack, commit the generated `.terraform.lock.hcl` (exact provider versions and checksums).
 - Running the function on your machine needs Azure Functions Core Tools and a `local.settings.json` (git-ignored). This README deploys to Azure instead.
@@ -134,6 +136,29 @@ union traces, exceptions, requests
 
 Run one query at a time: select its lines, then **Run**.
 
+## Monitoring
+
+Three alerts email `alert_email` (step 2) through the action group `ag-<name>`: one email when an alert fires, one when it resolves, nothing in between. Fired alerts are listed in the portal under **Monitor** → **Alerts**. No email? Check your spam folder.
+
+| Alert | Fires when | Then |
+|---|---|---|
+| `<name>-dead-letters` | a message is in the dead-letter queue (checked every minute) | triage it, below |
+| `<name>-backlog` | the queue has held more than `backlog_alert_threshold` messages (default 1,000) for 15 minutes: the function is falling behind, or stopped | is the app at its 50-instance cap, or a dependency slow? Is it running at all? The host logs its errors in `traces` |
+| `<name>-failures` | more than 5 runs failed within 15 minutes, each attempt counted | "Why did it fail?" in "Finding the logs" |
+
+Size `backlog_alert_threshold` (in `terraform.tfvars`) from the longest an order may wait. A message waits about backlog ÷ processing rate (Little's law), so the threshold is the rate the function reaches at full scale, measured with a load test, × that wait: for example 50 orders/s × 600 s = 30,000. Keep it above 800: messages being processed stay in the queue until completed and count too, up to 50 instances × 16 concurrent calls. For the same reason a busy queue is never empty, so 0 ("never emptied for 15 minutes") only suits a queue with long idle periods. The gap: with little traffic, a stopped function goes unnoticed until the threshold is reached (see "Before production").
+
+The dead-letter queue should stay empty. When a message lands there:
+
+1. **Look.** In the portal: the Service Bus namespace, **Queues**, `orders`, **Service Bus Explorer**, **Peek Mode**, **DeadLetter**, **Peek from start**. Each message shows its body, its message ID and, under **Message Properties**, its `DeadLetterReason`.
+2. **Understand.** Search the message ID in Application Insights ("The story of one order" in "Finding the logs"): one line per attempt, with its error.
+3. **Fix the cause, then re-process** the messages that should be: select them, **Re-send selected messages**, **Send**. This sends copies to the queue: the originals stay in the dead-letter queue.
+4. **Empty it.** **Receive Mode**, **DeadLetter**, **Receive messages**, mode **ReceiveAndDelete**. The alert resolves a few minutes later and fires again for the next message. Until then, new dead-lettered messages send no email: empty the queue after every triage.
+
+The test messages `down-4` and `invalid-5` only need step 4.
+
+These alerts cost nothing here: each one watches one metric time series, and Azure Monitor includes 10 per month, plus 1,000 emails. The portal may also list a *Failure Anomalies* alert rule: Azure adds it to Application Insights by itself (smart detection), outside Terraform.
+
 ## How it works
 
 ```mermaid
@@ -148,7 +173,7 @@ flowchart LR
 - **At-least-once.** A message can be delivered twice (a crash after processing, a lock that expired). The handler must be idempotent: deduplicate on a business key.
 - **Peek-lock.** The Functions host receives a message locked for 1 minute (`lock_duration`) and renews the lock while the function runs, up to 5 minutes (`host.json`). It completes the message when the function returns and abandons it when the function throws. Up to 16 messages run in parallel per instance.
 - **Retries are immediate.** Service Bus makes an abandoned message available again at once, and Azure Functions retry policies don't apply to Service Bus triggers. So a failing message uses its 5 attempts within seconds.
-- **Dead-letter queue, built in.** After 5 deliveries (`max_delivery_count`), Service Bus moves the message to the queue's dead-letter queue with `DeadLetterReason` = `MaxDeliveryCountExceeded`. An expired message goes there too. Dead-lettered messages don't expire: they stay until someone reads or re-sends them.
+- **Dead-letter queue, built in.** After 5 deliveries (`max_delivery_count`), Service Bus moves the message to the queue's dead-letter queue with `DeadLetterReason` = `MaxDeliveryCountExceeded`. An expired message goes there too. Dead-lettered messages don't expire: they stay until someone removes them (see "Monitoring").
 - **Crash loops.** An attempt that kills the process never reaches a `catch`, but the delivery count still grows, so the message still ends up dead-lettered.
 - **Messages that can never succeed.** A C# function could dead-letter such a message at once, with its own reason. Java functions can't settle messages themselves, so `invalid-*` takes the same 5 quick attempts; the real error is in the logs.
 - **Duplicate detection.** Within 10 minutes, a second message with the same message ID is dropped. Producers should use a business ID as the message ID, as the test messages do.
@@ -164,7 +189,7 @@ Azure hierarchy: tenant (Entra ID) > subscription (billing and access boundary) 
 | Stack | Run | Its state | Creates |
 |---|---|---|---|
 | `bootstrap/` | once per subscription | `bootstrap.tfstate`, in the storage it creates (a local file during the first apply only) | `rg-tfstate`: storage account + `tfstate` container holding every state |
-| `infra/` | at every change | `queuepoc.tfstate`, in the same storage | `rg-queuepoc`: Service Bus namespace and queue, Function App (Flex Consumption plan, runtime storage account), identity, RBAC, Application Insights |
+| `infra/` | at every change | `queuepoc.tfstate`, in the same storage | `rg-queuepoc`: Service Bus namespace and queue, Function App (Flex Consumption plan, runtime storage account), identity, RBAC, Application Insights, alerts |
 
 Why two stacks: the states must survive a `terraform destroy` of the PoC, so their storage needs its own lifecycle. The PoC's own resource group stays in `infra/` because it has the same lifecycle as the PoC. If a platform team hands you the resource group, replace the `azurerm_resource_group` resource with a `data "azurerm_resource_group"` lookup (referenced as `data.azurerm_resource_group.this`).
 
@@ -180,7 +205,7 @@ Practices applied:
 - **No secrets in the code**: none in code, variables, outputs or the backend config; the subscription comes from the environment. One key exists at runtime, the Functions runtime storage key (see "How it works").
 - **Secure defaults**: Entra ID only for Service Bus (local auth disabled) and for the state storage; TLS 1.2 and no public blobs on every storage account.
 - **Access through RBAC only**: the Function App's identity on the PoC's namespace (see "How it works"); operators (who send and inspect messages from their machine) listed explicitly in `operator_object_ids` once a pipeline applies.
-- **Readable**: typed, validated and documented variables and outputs, tags on every taggable resource, CAF naming (`rg-`, `sb-`, `st`, `id-`, `func-`, `asp-`, `appi-`, `log-`), flat code (no module until something is reused).
+- **Readable**: typed, validated and documented variables and outputs, tags on every taggable resource, CAF naming (`rg-`, `sb-`, `st`, `id-`, `func-`, `asp-`, `appi-`, `log-`, `ag-`), flat code (no module until something is reused).
 
 ## Settings
 
@@ -195,6 +220,9 @@ Practices applied:
 | `logging.applicationInsights.samplingSettings.isEnabled` | `app/host.json` | `false` | every log line reaches Application Insights (sampling would drop some) |
 | `maximum_instance_count` | `infra/main.tf` | `50` | scale-out cap, and so cost cap |
 | `instance_memory_in_mb` | `infra/main.tf` | `2048` | memory per instance |
+| `alert_email` | `infra/terraform.tfvars` | your address | who receives the alerts |
+| `backlog_alert_threshold` | `infra/terraform.tfvars` | `1000` | messages held 15 minutes before the backlog alert fires: size it from a load test (see "Monitoring") |
+| other alert thresholds | `infra/main.tf` | see "Monitoring" | when the dead-letter and failure alerts fire |
 | `QUEUE_NAME`, `ServiceBus__*` | app settings, set by Terraform | | queue name and the identity-based Service Bus connection |
 
 ## Before production
@@ -209,6 +237,7 @@ Practices applied:
 - One state key and one `backend.hcl` per environment (`dev`, `prod`), ideally one subscription per environment.
 - Protect stateful resources: the state storage already has `prevent_destroy`; production namespaces and queues need it too. A `CanNotDelete` lock also blocks deletion from the portal or the CLI.
 - `terraform fmt -check`, `terraform validate`, `tflint` and `checkov` (or `trivy config`) in CI.
-- Alert on the dead-letter queue: Service Bus's `DeadletteredMessages` metric is per queue (dimension `EntityName`), so an Azure Monitor alert can watch it directly.
+- Alerts where the team works: a shared mailbox, or Teams or an on-call tool through a webhook in the action group. Give the dead-letter queue an owner who triages it within an agreed time.
+- A heartbeat, to catch a stopped function when traffic is low: a timer function sends a test message every 5 minutes, and an alert fires when none was processed for 15 minutes. Below `backlog_alert_threshold`, nothing else notices a function that doesn't start: scaled to zero, it logs nothing.
 - Turn Application Insights sampling back on in `host.json` to control its cost: it never drops exceptions or invocations, only log lines.
 - Long processing: the host renews the lock for up to `maxAutoLockRenewalDuration`; mind `functionTimeout` in `host.json` too.

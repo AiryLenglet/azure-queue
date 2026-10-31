@@ -29,5 +29,11 @@ provider "azurerm" {
   # Shared keys are disabled on the storage account: any data-plane call must use Entra ID
   storage_use_azuread = true
 
-  features {}
+  features {
+    # Azure adds a "Failure Anomalies" alert rule and its action group next to Application Insights, outside Terraform.
+    # The PoC's resource group holds nothing else: let terraform destroy delete it with them.
+    resource_group {
+      prevent_deletion_if_contains_resources = false
+    }
+  }
 }

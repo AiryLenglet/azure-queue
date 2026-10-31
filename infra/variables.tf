@@ -36,3 +36,24 @@ variable "operator_object_ids" {
     error_message = "Object IDs are GUIDs. Yours: az ad signed-in-user show --query id -o tsv"
   }
 }
+
+variable "alert_email" {
+  description = "Email address the alerts are sent to (README, Monitoring). Set it in terraform.tfvars, which git ignores."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.alert_email))
+    error_message = "An email address, such as you@example.com."
+  }
+}
+
+variable "backlog_alert_threshold" {
+  description = "Alert when the queue holds more than this many messages for 15 minutes. Size it as messages processed per second at full scale x seconds an order may wait, above 800 (README, Monitoring)."
+  type        = number
+  default     = 1000
+
+  validation {
+    condition     = var.backlog_alert_threshold >= 0 && floor(var.backlog_alert_threshold) == var.backlog_alert_threshold
+    error_message = "A whole number of messages, 0 or more."
+  }
+}
