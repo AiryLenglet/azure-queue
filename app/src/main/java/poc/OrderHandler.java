@@ -7,18 +7,17 @@ import java.util.concurrent.ThreadLocalRandom;
  * <ul>
  *   <li>Idempotent: delivery is at-least-once, the same message can come twice.
  *       Deduplicate on a business key (e.g. unique constraint on the order id).</li>
- *   <li>Throw {@link NonRetryableException} when retrying cannot help (bad payload, business rule):
- *       the message goes straight to the poison queue. Any other exception is retried.</li>
+ *   <li>Throw when processing fails: the message is retried, then dead-lettered.</li>
  *   <li>Put a timeout on every I/O call: a stuck call holds the message until the function times out.</li>
  * </ul>
- * Demo payloads (sent with the Azure CLI, see the README): ok-N, flaky-N (fails half the attempts), down-N (always fails),
- * invalid-N.
+ * Demo payloads (sent with curl, see the README): ok-N, flaky-N (fails half the attempts), down-N (always fails),
+ * invalid-N (can never succeed).
  */
 final class OrderHandler {
 
     static void process(String order) throws Exception {
         if (order.startsWith("invalid")) {
-            throw new NonRetryableException("cannot parse '" + order + "'");
+            throw new IllegalArgumentException("cannot parse '" + order + "'");
         }
         if (order.startsWith("down")) {
             throw new IllegalStateException("payment service unavailable for '" + order + "' (simulated)");

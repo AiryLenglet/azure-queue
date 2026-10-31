@@ -24,7 +24,7 @@ provider "azurerm" {
   # Subscription: ARM_SUBSCRIPTION_ID environment variable (see README)
 
   # azurerm 5.x no longer registers resource providers by default
-  resource_providers_to_register = ["Microsoft.Storage", "Microsoft.ManagedIdentity", "Microsoft.Web", "Microsoft.OperationalInsights", "Microsoft.Insights"]
+  resource_providers_to_register = ["Microsoft.ServiceBus", "Microsoft.Storage", "Microsoft.ManagedIdentity", "Microsoft.Web", "Microsoft.OperationalInsights", "Microsoft.Insights"]
 
   # Shared keys are disabled on the storage account: any data-plane call must use Entra ID
   storage_use_azuread = true

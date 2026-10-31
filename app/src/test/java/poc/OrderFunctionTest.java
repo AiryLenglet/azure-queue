@@ -1,7 +1,6 @@
 package poc;
 
 import com.microsoft.azure.functions.ExecutionContext;
-import com.microsoft.azure.functions.OutputBinding;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
@@ -13,41 +12,35 @@ import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Calls the function the way the Functions host does, and checks what the host would then do with the message:
- * the function returns = deleted, it throws = retried, it writes the poison output = sent to the poison queue.
+ * Calls the function the way the Functions host does, and checks what would then happen to the message:
+ * the function returns = completed (deleted), it throws = redelivered, then dead-lettered after the last attempt.
  * Also checks that every log line carries the order, the message ID and the attempt.
  */
 class OrderFunctionTest {
 
     private final OrderFunction function = new OrderFunction();
-    private final Poison poison = new Poison();
     private final List<String> logs = new ArrayList<>();
     private final ExecutionContext context = contextLoggingTo(logs);
 
     @Test
     void validOrderIsProcessed() {
-        assertDoesNotThrow(() -> function.run("ok-1", "m-1", 1, poison, context));
-        assertNull(poison.getValue());
+        assertDoesNotThrow(() -> function.run("ok-1", "m-1", 1, context));
         assertEquals(List.of("INFO Processed order ok-1 (message m-1, attempt 1)"), logs);
     }
 
     @Test
-    void nonRetryableOrderGoesStraightToThePoisonQueue() {
-        assertDoesNotThrow(() -> function.run("invalid-1", "m-2", 1, poison, context)); // returns: the original is deleted
-        assertEquals("invalid-1", poison.getValue());
-        assertEquals(List.of("WARNING Moved order invalid-1 (message m-2, attempt 1) to the poison queue: "
-                + "cannot parse 'invalid-1'"), logs);
+    void invalidOrderFailsEveryAttempt() {
+        assertThrows(IllegalArgumentException.class, () -> function.run("invalid-1", "m-2", 1, context));
+        assertEquals(List.of("WARNING Failed order invalid-1 (message m-2, attempt 1): cannot parse 'invalid-1'"), logs);
     }
 
     @Test
-    void transientFailureIsLoggedAndLeftToTheHostToRetry() {
-        assertThrows(IllegalStateException.class, () -> function.run("down-1", "m-3", 2, poison, context));
-        assertNull(poison.getValue()); // after 5 attempts the host moves it to the poison queue itself
+    void transientFailureIsLoggedAndRedelivered() {
+        assertThrows(IllegalStateException.class, () -> function.run("down-1", "m-3", 2, context));
         assertEquals(List.of("WARNING Failed order down-1 (message m-3, attempt 2): "
                 + "payment service unavailable for 'down-1' (simulated)"), logs);
     }
@@ -58,28 +51,13 @@ class OrderFunctionTest {
         boolean succeeded = false;
         for (int i = 0; i < 50 && !(failed && succeeded); i++) { // missing an outcome in 50 tries: about 1 in 10^15
             try {
-                function.run("flaky-1", "m-4", i + 1, poison, context);
+                function.run("flaky-1", "m-4", i + 1, context);
                 succeeded = true;
             } catch (Exception e) {
                 failed = true;
             }
         }
         assertTrue(failed && succeeded);
-    }
-
-    /** What the host passes as the poison output: it keeps the value the function writes. */
-    private static final class Poison implements OutputBinding<String> {
-        private String value;
-
-        @Override
-        public String getValue() {
-            return value;
-        }
-
-        @Override
-        public void setValue(String value) {
-            this.value = value;
-        }
     }
 
     /**

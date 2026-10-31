@@ -7,10 +7,7 @@ resource "random_string" "suffix" {
 }
 
 locals {
-  queue_service_url = trimsuffix(azurerm_storage_account.this.primary_queue_endpoint, "/")
-  queues_scope      = "${azurerm_storage_account.this.id}/queueServices/default/queues"
-
-  # Who gets data access to the queues from their machine: var.operator_object_ids, or else whoever runs `terraform apply`
+  # Who gets data access to the Service Bus from their machine: var.operator_object_ids, or else whoever runs `terraform apply`
   operators = toset(coalescelist(var.operator_object_ids, [data.azurerm_client_config.current.object_id]))
 
   # Set on every resource that supports tags (cost reports, ownership, policy)
@@ -28,46 +25,42 @@ resource "azurerm_resource_group" "this" {
   tags     = local.tags
 }
 
-resource "azurerm_storage_account" "this" {
-  name                     = "st${var.name}${random_string.suffix.result}" # globally unique
-  resource_group_name      = azurerm_resource_group.this.name
-  location                 = azurerm_resource_group.this.location
-  account_tier             = "Standard"
-  account_replication_type = var.replication_type
-  tags                     = local.tags
+# --- Service Bus: the queue and its dead-letter queue -----------------------------------------------
 
-  # Entra ID (RBAC) only: no account keys, no SAS, no connection strings to leak
-  shared_access_key_enabled       = false
-  default_to_oauth_authentication = true
-  min_tls_version                 = "TLS1_2"
-  https_traffic_only_enabled      = true
-  allow_nested_items_to_be_public = false
+resource "azurerm_servicebus_namespace" "this" {
+  name                = "sb-${var.name}-${random_string.suffix.result}" # globally unique: <name>.servicebus.windows.net
+  resource_group_name = azurerm_resource_group.this.name
+  location            = azurerm_resource_group.this.location
+  sku                 = "Standard" # Basic has no duplicate detection, sessions, transactions or topics
+  local_auth_enabled  = false      # Entra ID only: no SAS keys, no connection strings
+  tags                = local.tags
 }
 
-resource "azurerm_storage_queue" "main" {
-  name               = var.queue_name
-  storage_account_id = azurerm_storage_account.this.id
+# Every queue has a built-in dead-letter queue (<queue>/$deadletterqueue). Service Bus moves a message there after
+# max_delivery_count failed attempts, or when it expires, and records the reason in the message's properties.
+resource "azurerm_servicebus_queue" "orders" {
+  name         = var.queue_name
+  namespace_id = azurerm_servicebus_namespace.this.id
+
+  max_delivery_count                      = 5      # attempts, then the dead-letter queue
+  lock_duration                           = "PT1M" # a message is locked while processed; the Functions host renews the lock
+  dead_lettering_on_message_expiration    = true   # an expired message goes to the dead-letter queue instead of vanishing
+  requires_duplicate_detection            = true   # a message ID seen within the window is dropped (can't be changed later)
+  duplicate_detection_history_time_window = "PT10M"
 }
 
-# Storage queues have no built-in dead-letter queue: the consumer moves failed messages here.
-# "<queue>-poison" is the convention used by Azure Functions.
-resource "azurerm_storage_queue" "poison" {
-  name               = "${var.queue_name}-poison"
-  storage_account_id = azurerm_storage_account.this.id
-}
-
-# --- Operators: run the producer, consumer and tools from their machine after `az login` ----------
+# --- Operators: send test messages and inspect the dead-letter queue from their machine ------------
 # Owner/Contributor do not give access to messages: data-plane roles are separate.
 # Once a pipeline runs Terraform, set var.operator_object_ids: otherwise the pipeline's own identity would grant
 # itself this access and remove yours.
 resource "azurerm_role_assignment" "operators" {
   for_each             = local.operators
-  scope                = azurerm_storage_account.this.id
-  role_definition_name = "Storage Queue Data Contributor"
+  scope                = azurerm_servicebus_namespace.this.id
+  role_definition_name = "Azure Service Bus Data Owner"
   principal_id         = each.value
 }
 
-# --- The Function's identity: queue access with Entra ID, least privilege, per queue ---------------
+# --- The Function's identity: Service Bus access with Entra ID, no key -----------------------------
 resource "azurerm_user_assigned_identity" "consumer" {
   name                = "id-${var.name}-consumer"
   resource_group_name = azurerm_resource_group.this.name
@@ -75,49 +68,20 @@ resource "azurerm_user_assigned_identity" "consumer" {
   tags                = local.tags
 }
 
-# What the queue trigger needs on the main queue, nothing else: Microsoft documents "Storage Queue Data Reader" and
-# "Message Processor" for the trigger, and the host also updates messages (lease renewal, retry delay).
-# No built-in role is that narrow: "Data Contributor" can also change or delete the queue itself.
-resource "azurerm_role_definition" "queue_consumer" {
-  name        = "Queue consumer (${azurerm_storage_account.this.name})" # custom role names are unique per tenant
-  scope       = azurerm_resource_group.this.id
-  description = "Read a queue; receive, peek, delete and update its messages. Nothing else."
-
-  permissions {
-    actions = [
-      "Microsoft.Storage/storageAccounts/queueServices/queues/read", # the queue itself, as in Storage Queue Data Reader
-    ]
-    data_actions = [
-      "Microsoft.Storage/storageAccounts/queueServices/queues/messages/read",           # peek
-      "Microsoft.Storage/storageAccounts/queueServices/queues/messages/process/action", # receive, delete
-      "Microsoft.Storage/storageAccounts/queueServices/queues/messages/write",          # update: lease renewal while running, retry delay
-    ]
-  }
-
-  assignable_scopes = [azurerm_resource_group.this.id]
-}
-
-resource "azurerm_role_assignment" "consumer_main" {
-  scope              = "${local.queues_scope}/${azurerm_storage_queue.main.name}"
-  role_definition_id = azurerm_role_definition.queue_consumer.role_definition_resource_id
-  principal_id       = azurerm_user_assigned_identity.consumer.principal_id
-  principal_type     = "ServicePrincipal" # avoids failures while the new identity replicates in Entra ID
-}
-
-# The host moves failed messages here and the output binding writes the non-retryable ones. Both may create the queue
-# if it's missing, which "Message Sender" can't do: Microsoft documents Contributor for queue outputs. Scoped to this queue.
-resource "azurerm_role_assignment" "consumer_poison" {
-  scope                = "${local.queues_scope}/${azurerm_storage_queue.poison.name}"
-  role_definition_name = "Storage Queue Data Contributor"
+# Processing messages only needs "Data Receiver" on the queue. But to scale the app out from zero, the Flex Consumption
+# scale controller reads the queue length with this identity, which takes manage rights: "Data Owner".
+# Scoped to this PoC's namespace, which holds nothing else.
+resource "azurerm_role_assignment" "consumer" {
+  scope                = azurerm_servicebus_namespace.this.id
+  role_definition_name = "Azure Service Bus Data Owner"
   principal_id         = azurerm_user_assigned_identity.consumer.principal_id
-  principal_type       = "ServicePrincipal"
+  principal_type       = "ServicePrincipal" # avoids failures while the new identity replicates in Entra ID
 }
 
 # --- The Azure Function: Flex Consumption plan, scales to zero, billed per execution ----------------------
 
 # Runtime storage of the Function App: host state and deployment packages, none of your messages. Shared keys stay
 # enabled here because the azurerm Flex resource doesn't handle keyless runtime storage yet (provider issue 30732).
-# Your messages stay in the keyless account above.
 resource "azurerm_storage_account" "functions" {
   name                     = "st${var.name}fn${random_string.suffix.result}" # globally unique
   resource_group_name      = azurerm_resource_group.this.name
@@ -183,18 +147,18 @@ resource "azurerm_function_app_flex_consumption" "this" {
   storage_authentication_type = "StorageAccountConnectionString"
   storage_access_key          = azurerm_storage_account.functions.primary_access_key
 
-  # The queues: Entra ID with the consumer identity, no key
+  # Service Bus: Entra ID with the consumer identity, no key
   identity {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.consumer.id]
   }
 
+  # "ServiceBus" is the connection name in OrderFunction: its ServiceBus__* settings select Entra ID and the identity
   app_settings = {
-    QueueStorage__queueServiceUri = local.queue_service_url # "QueueStorage" is the connection name in OrderFunction
-    QueueStorage__credential      = "managedidentity"
-    QueueStorage__clientId        = azurerm_user_assigned_identity.consumer.client_id
-    QUEUE_NAME                    = azurerm_storage_queue.main.name
-    POISON_QUEUE_NAME             = azurerm_storage_queue.poison.name
+    ServiceBus__fullyQualifiedNamespace = "${azurerm_servicebus_namespace.this.name}.servicebus.windows.net"
+    ServiceBus__credential              = "managedidentity"
+    ServiceBus__clientId                = azurerm_user_assigned_identity.consumer.client_id
+    QUEUE_NAME                          = azurerm_servicebus_queue.orders.name
   }
 
   site_config {

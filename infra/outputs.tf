@@ -1,11 +1,11 @@
-output "queue_name" {
-  description = "Main queue."
-  value       = azurerm_storage_queue.main.name
+output "servicebus_namespace" {
+  description = "Service Bus namespace: <name>.servicebus.windows.net."
+  value       = azurerm_servicebus_namespace.this.name
 }
 
-output "poison_queue_name" {
-  description = "Poison queue."
-  value       = azurerm_storage_queue.poison.name
+output "queue_name" {
+  description = "Service Bus queue the function consumes. Its dead-letter queue is <queue>/$deadletterqueue."
+  value       = azurerm_servicebus_queue.orders.name
 }
 
 output "function_app_name" {
@@ -19,9 +19,7 @@ output "env" {
     export RESOURCE_GROUP=${azurerm_resource_group.this.name}
     export FUNCTION_APP=${azurerm_function_app_flex_consumption.this.name}
     export APP_INSIGHTS=${azurerm_application_insights.this.name}
-    export QUEUE_NAME=${azurerm_storage_queue.main.name}
-    export POISON_QUEUE_NAME=${azurerm_storage_queue.poison.name}
-    export AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.this.name}
-    export AZURE_STORAGE_AUTH_MODE=login
+    export SERVICEBUS_NAMESPACE=${azurerm_servicebus_namespace.this.name}
+    export QUEUE_NAME=${azurerm_servicebus_queue.orders.name}
   EOT
 }
